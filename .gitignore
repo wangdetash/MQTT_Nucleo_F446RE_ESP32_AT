@@ -32,3 +32,6 @@ Desktop.ini
 
 # Keep CubeMX and shared IDE project configuration tracked:
 # .ioc, .mxproject, .project, .cproject, source, drivers and linker scripts
+
+# Locally supplied IoT SDK
+/IOT_SDK/
