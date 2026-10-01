@@ -1,0 +1,34 @@
+# STM32CubeIDE build output
+Debug/
+Release/
+build/
+*.o
+*.d
+*.su
+*.cyclo
+*.elf
+*.axf
+*.map
+*.list
+*.lst
+*.hex
+*.bin
+*.a
+
+# Eclipse / STM32CubeIDE workspace and machine-local settings
+.metadata/
+.settings/
+*.launch
+.recommenders/
+
+# Editor backups and operating-system files
+*~
+*.bak
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Keep CubeMX and shared IDE project configuration tracked:
+# .ioc, .mxproject, .project, .cproject, source, drivers and linker scripts
