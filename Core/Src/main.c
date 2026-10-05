@@ -22,6 +22,9 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include <stdio.h>
+#include "esp32_at.h"
+#include "mqtt_helper.h"
+#include "application_config.h"
 
 /* USER CODE END Includes */
 
@@ -108,6 +111,53 @@ int main(void)
   /* USER CODE BEGIN 2 */
   setvbuf(stdout, NULL, _IONBF, 0);
   printf("Application running ...\r\n");
+  if (esp32_init() != ESP32_OK)
+  {
+    printf("Wifi module Init failed\r\n");
+    /* Do not use the module after initialization fails. */
+    while (1)
+    {
+      HAL_Delay(1000);
+    }
+  }
+  printf("Wifi Module inti successfull\r\n");
+  while (esp32_join_ap((uint8_t *)WIFI_SSID,
+                       (uint8_t *)WIFI_PASSWORD) != ESP32_OK)
+  {
+    printf("Wifi connection to \"%s\" failed\r\n", WIFI_SSID);
+    HAL_Delay(2000);
+  }
+  printf("Wifi connection to \"%s\" successfull\r\n", WIFI_SSID);
+  if (esp32_config_sntp(UTC_OFFSET) == ESP32_OK)
+  {
+    printf("SNTP Config Successfull\r\n");
+    sntp_time_t current_time = {0};
+    if (esp32_get_sntp_time(&current_time) == ESP32_OK)
+    {
+      printf("Time (IST): %02d:%02d:%02d\r\n",
+             current_time.hour, current_time.min, current_time.sec);
+      printf("Day: %s, Date: %02d, Month: %s, Year: %04d\r\n",
+             current_time.day, current_time.date,
+             current_time.month, current_time.year);
+    }
+    else
+    {
+      printf("failed to retrieve current time\r\n");
+    }
+  }
+  else
+  {
+    printf("SNTP config failed\r\n");
+  }
+  if(mqtt_connect(CLIENT_ID, MQTT_BROKER, MQTT_PORT) == MQTT_SUCCESS)
+  {
+	printf("mqtt connection successfull\r\n");
+  }
+  else
+  {
+	  printf("Mqtt connection failed\r\n");
+  }
+
 
   /* USER CODE END 2 */
 
