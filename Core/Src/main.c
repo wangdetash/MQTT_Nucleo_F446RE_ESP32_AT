@@ -122,6 +122,19 @@ int main(void)
   setvbuf(stdout, NULL, _IONBF, 0);
   printf("Application running ...\r\n");
   esp32_status_t esp_status = esp32_init();
+  /* Initialize UART DMA before requesting the module's version. */
+  static char firmware_version[1024];
+  esp32_status_t version_status = esp32_get_firmware_version(
+      firmware_version, sizeof(firmware_version));
+  if (version_status == ESP32_OK)
+  {
+    printf("ESP-AT firmware version:\r\n%s", firmware_version);
+  }
+  else
+  {
+    printf("ESP-AT firmware version query failed (status=%d)\r\n",
+           (int)version_status);
+  }
   printf("esp32_init: %s (status=%d)\r\n",
          esp_status == ESP32_OK ? "succeeded" : "failed", (int)esp_status);
 
