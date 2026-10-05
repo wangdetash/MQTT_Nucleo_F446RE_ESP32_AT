@@ -22,6 +22,12 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include <stdio.h>
+#include <string.h>
+#include "FreeRTOS.h"
+#include "task.h"
+#include "semphr.h"
+#include "mqtt_helper.h"
+#include "application_config.h"
 
 /* USER CODE END Includes */
 
@@ -46,6 +52,11 @@ UART_HandleTypeDef huart2;
 DMA_HandleTypeDef hdma_uart4_rx;
 
 /* USER CODE BEGIN PV */
+/* xTaskCreate stack depth is in StackType_t words: 2048 = 8192 bytes. */
+#define MQTT_TASK_STACK_DEPTH 2048U
+static SemaphoreHandle_t mqtt_mutex;
+static volatile uint32_t pending_interrupts;
+static uint32_t count;
 
 /* USER CODE END PV */
 
@@ -56,6 +67,8 @@ static void MX_DMA_Init(void);
 static void MX_UART4_Init(void);
 static void MX_USART2_UART_Init(void);
 /* USER CODE BEGIN PFP */
+static void mqtt_publish_task(void *argument);
+static void mqtt_sucscribe_task(void *argument);
 
 /* USER CODE END PFP */
 
@@ -108,6 +121,34 @@ int main(void)
   /* USER CODE BEGIN 2 */
   setvbuf(stdout, NULL, _IONBF, 0);
   printf("Application running ...\r\n");
+  esp32_status_t esp_status = esp32_init();
+  printf("esp32_init: %s (status=%d)\r\n",
+         esp_status == ESP32_OK ? "succeeded" : "failed", (int)esp_status);
+
+  esp_status = esp32_join_ap((uint8_t *)WIFI_SSID, (uint8_t *)WIFI_PASSWORD);
+  printf("esp32_join_ap: %s (status=%d)\r\n",
+         esp_status == ESP32_OK ? "succeeded" : "failed", (int)esp_status);
+
+  esp_status = esp32_config_sntp(UTC_OFFSET);
+  printf("esp32_config_sntp: %s (status=%d)\r\n",
+         esp_status == ESP32_OK ? "succeeded" : "failed", (int)esp_status);
+
+  mqtt_status_t mqtt_status = mqtt_connect(CLIENT_ID, MQTT_BROKER, MQTT_PORT);
+  printf("mqtt_connect: %s (status=%d)\r\n",
+         mqtt_status == MQTT_SUCCESS ? "succeeded" : "failed", (int)mqtt_status);
+
+  mqtt_mutex = xSemaphoreCreateMutex();
+  if (mqtt_mutex == NULL ||
+      xTaskCreate(mqtt_publish_task, "mqtt_publish_task", MQTT_TASK_STACK_DEPTH,
+                  NULL, tskIDLE_PRIORITY + 1, NULL) != pdPASS /*||
+      xTaskCreate(mqtt_sucscribe_task, "mqtt_sucscribe_task", MQTT_TASK_STACK_DEPTH,
+                  NULL, tskIDLE_PRIORITY + 1, NULL) != pdPASS*/)
+  {
+    printf("MQTT task creation failed\r\n");
+    Error_Handler();
+  }
+  vTaskStartScheduler();
+  Error_Handler(); /* Scheduler returns only if it cannot start. */
 
   /* USER CODE END 2 */
 
@@ -291,7 +332,7 @@ static void MX_GPIO_Init(void)
   HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
   /* EXTI interrupt init*/
-  HAL_NVIC_SetPriority(EXTI15_10_IRQn, 0, 0);
+  HAL_NVIC_SetPriority(EXTI15_10_IRQn, 5, 0);
   HAL_NVIC_EnableIRQ(EXTI15_10_IRQn);
 
   /* USER CODE BEGIN MX_GPIO_Init_2 */
@@ -300,6 +341,102 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
+void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
+{
+  if (GPIO_Pin == GPIO_PIN_13 && pending_interrupts != UINT32_MAX)
+  {
+    ++pending_interrupts;
+  }
+}
+
+static unsigned int mqtt_month_number(const char *month)
+{
+  static const char * const months[] = {
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+    "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"
+  };
+  for (unsigned int i = 0; i < 12; ++i)
+  {
+    if (strcmp(month, months[i]) == 0) return i + 1;
+  }
+  return 0;
+}
+
+static void mqtt_publish_task(void *argument)
+{
+  (void)argument;
+  for (;;)
+  {
+    uint32_t interrupt_occurred = 0;
+    /* EXTI priority 5 is masked by this critical section. Keep queued events. */
+    taskENTER_CRITICAL();
+    if (pending_interrupts > 0)
+    {
+      pending_interrupts = 0;
+      interrupt_occurred = 1;
+    }
+    taskEXIT_CRITICAL();
+
+    if (interrupt_occurred)
+    {
+      char payload[160];
+      sntp_time_t timestamp = {0};
+      ++count;
+      xSemaphoreTake(mqtt_mutex, portMAX_DELAY);
+      printf("count: %lu\r\n", (unsigned long)count);
+      esp32_status_t time_status = esp32_get_sntp_time(&timestamp);
+      unsigned int month = mqtt_month_number(timestamp.month);
+      if (time_status == ESP32_OK && month != 0 &&
+          timestamp.year >= 2020 && timestamp.year <= 9999 &&
+          timestamp.date >= 1 && timestamp.date <= 31 &&
+          timestamp.hour >= 0 && timestamp.hour <= 23 &&
+          timestamp.min >= 0 && timestamp.min <= 59 &&
+          timestamp.sec >= 0 && timestamp.sec <= 59)
+      {
+        int length = snprintf(payload, sizeof(payload),
+            "{\"count\":%lu,\"time\":\"%02d:%02d:%02d\","
+            "\"date\":\"%04d-%02u-%02d\"}",
+            (unsigned long)count, timestamp.hour, timestamp.min, timestamp.sec,
+            timestamp.year, month, timestamp.date);
+        if (length > 0 && (size_t)length < sizeof(payload))
+        {
+          mqtt_status_t status = mqtt_publish(SENSOR_DATA_TOPIC,
+              strlen(SENSOR_DATA_TOPIC), (uint8_t *)payload, (size_t)length);
+          printf("MQTT publish %s (status=%d)\r\n",
+                 status == MQTT_SUCCESS ? "succeeded" : "failed", (int)status);
+        }
+        else
+        {
+          printf("MQTT publish failed: JSON buffer too small\r\n");
+        }
+      }
+      else
+      {
+        printf("MQTT publish failed: valid SNTP date/time unavailable\r\n");
+      }
+      xSemaphoreGive(mqtt_mutex);
+    }
+    vTaskDelay(pdMS_TO_TICKS(5000));
+  }
+}
+
+static void mqtt_sucscribe_task(void *argument)
+{
+  (void)argument;
+  mqtt_status_t status = MQTT_ERROR;
+  for (;;)
+  {
+    if (status != MQTT_SUCCESS)
+    {
+      xSemaphoreTake(mqtt_mutex, portMAX_DELAY);
+//      status = mqtt_subscribe(RAZORPAY_TOPIC, strlen(RAZORPAY_TOPIC));
+//      printf("MQTT subscribe %s (status=%d)\r\n",
+//             status == MQTT_SUCCESS ? "succeeded" : "failed", (int)status);
+//      xSemaphoreGive(mqtt_mutex);
+    }
+    vTaskDelay(pdMS_TO_TICKS(5000));
+  }
+}
 
 /* USER CODE END 4 */
 
