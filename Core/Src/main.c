@@ -26,6 +26,7 @@
 #include "FreeRTOS.h"
 #include "task.h"
 #include "semphr.h"
+#include "esp32_at.h"
 #include "mqtt_helper.h"
 #include "application_config.h"
 

@@ -35,3 +35,6 @@ Desktop.ini
 
 # Locally supplied IoT SDK
 /IOT_SDK/
+
+# Local application configuration (Wi-Fi credentials)
+/IOT_SDK/config/application_config.h
