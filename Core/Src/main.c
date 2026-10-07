@@ -25,9 +25,11 @@
 #include <string.h>
 #include "FreeRTOS.h"
 #include "task.h"
-#include "semphr.h"
+#include "queue.h"
 #include "esp32_at.h"
+#include "esp32_at_io.h"
 #include "mqtt_helper.h"
+#include "mqtt_queue.h"
 #include "application_config.h"
 
 /* USER CODE END Includes */
@@ -55,7 +57,13 @@ DMA_HandleTypeDef hdma_uart4_rx;
 /* USER CODE BEGIN PV */
 /* xTaskCreate stack depth is in StackType_t words: 2048 = 8192 bytes. */
 #define MQTT_TASK_STACK_DEPTH 2048U
-static SemaphoreHandle_t mqtt_mutex;
+static QueueHandle_t mqtt_tx_queue;
+static QueueHandle_t mqtt_rx_queue;
+static TaskHandle_t mqtt_publisher_handle;
+static TaskHandle_t at_dispatcher_handle;
+/* The notification handshake transfers this snapshot to the publisher. */
+static sntp_time_t publish_timestamp;
+static esp32_status_t publish_time_status;
 static volatile uint32_t pending_interrupts;
 static uint32_t count;
 
@@ -69,7 +77,8 @@ static void MX_UART4_Init(void);
 static void MX_USART2_UART_Init(void);
 /* USER CODE BEGIN PFP */
 static void mqtt_publish_task(void *argument);
-static void mqtt_sucscribe_task(void *argument);
+static void mqtt_recieve_task(void *argument);
+static void AT_cmd_dispatcher_task(void *argument);
 
 /* USER CODE END PFP */
 
@@ -151,12 +160,15 @@ int main(void)
   printf("mqtt_connect: %s (status=%d)\r\n",
          mqtt_status == MQTT_SUCCESS ? "succeeded" : "failed", (int)mqtt_status);
 
-  mqtt_mutex = xSemaphoreCreateMutex();
-  if (mqtt_mutex == NULL ||
+  mqtt_tx_queue = xQueueCreate(5, sizeof(mqtt_queue_item_t));
+  mqtt_rx_queue = xQueueCreate(5, sizeof(mqtt_queue_item_t));
+  if (mqtt_tx_queue == NULL || mqtt_rx_queue == NULL ||
       xTaskCreate(mqtt_publish_task, "mqtt_publish_task", MQTT_TASK_STACK_DEPTH,
-                  NULL, tskIDLE_PRIORITY + 1, NULL) != pdPASS /*||
-      xTaskCreate(mqtt_sucscribe_task, "mqtt_sucscribe_task", MQTT_TASK_STACK_DEPTH,
-                  NULL, tskIDLE_PRIORITY + 1, NULL) != pdPASS*/)
+                  NULL, tskIDLE_PRIORITY + 2, &mqtt_publisher_handle) != pdPASS ||
+      xTaskCreate(mqtt_recieve_task, "mqtt_recieve_task", MQTT_TASK_STACK_DEPTH,
+                  NULL, tskIDLE_PRIORITY + 2, NULL) != pdPASS ||
+      xTaskCreate(AT_cmd_dispatcher_task, "AT_cmd_dispatcher_task", MQTT_TASK_STACK_DEPTH,
+                  NULL, tskIDLE_PRIORITY + 1, &at_dispatcher_handle) != pdPASS)
   {
     printf("MQTT task creation failed\r\n");
     Error_Handler();
@@ -393,12 +405,17 @@ static void mqtt_publish_task(void *argument)
 
     if (interrupt_occurred)
     {
-      char payload[160];
-      sntp_time_t timestamp = {0};
+      mqtt_queue_item_t item = {
+        .operation = MQTT_OPERATION_PUBLISH,
+        .topic = SENSOR_DATA_BUTTON_PRESS_TOPIC,
+        .topic_length = sizeof(SENSOR_DATA_BUTTON_PRESS_TOPIC) - 1
+      };
       ++count;
-      xSemaphoreTake(mqtt_mutex, portMAX_DELAY);
-      printf("count: %lu\r\n", (unsigned long)count);
-      esp32_status_t time_status = esp32_get_sntp_time(&timestamp);
+      /* Only the dispatcher may query the ESP32, including its SNTP clock. */
+      xTaskNotifyGive(at_dispatcher_handle);
+      ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+      sntp_time_t timestamp = publish_timestamp;
+      esp32_status_t time_status = publish_time_status;
       unsigned int month = mqtt_month_number(timestamp.month);
       if (time_status == ESP32_OK && month != 0 &&
           timestamp.year >= 2020 && timestamp.year <= 9999 &&
@@ -407,17 +424,15 @@ static void mqtt_publish_task(void *argument)
           timestamp.min >= 0 && timestamp.min <= 59 &&
           timestamp.sec >= 0 && timestamp.sec <= 59)
       {
-        int length = snprintf(payload, sizeof(payload),
+        int length = snprintf((char *)item.payload, sizeof(item.payload),
             "{\"count\":%lu,\"time\":\"%02d:%02d:%02d\","
             "\"date\":\"%04d-%02u-%02d\"}",
             (unsigned long)count, timestamp.hour, timestamp.min, timestamp.sec,
             timestamp.year, month, timestamp.date);
-        if (length > 0 && (size_t)length < sizeof(payload))
+        if (length > 0 && (size_t)length < sizeof(item.payload))
         {
-          mqtt_status_t status = mqtt_publish(SENSOR_DATA_TOPIC,
-              strlen(SENSOR_DATA_TOPIC), (uint8_t *)payload, (size_t)length);
-          printf("MQTT publish %s (status=%d)\r\n",
-                 status == MQTT_SUCCESS ? "succeeded" : "failed", (int)status);
+          item.payload_length = (size_t)length;
+          xQueueSend(mqtt_tx_queue, &item, portMAX_DELAY);
         }
         else
         {
@@ -428,27 +443,89 @@ static void mqtt_publish_task(void *argument)
       {
         printf("MQTT publish failed: valid SNTP date/time unavailable\r\n");
       }
-      xSemaphoreGive(mqtt_mutex);
     }
     vTaskDelay(pdMS_TO_TICKS(5000));
   }
 }
 
-static void mqtt_sucscribe_task(void *argument)
+static void mqtt_recieve_task(void *argument)
 {
   (void)argument;
-  mqtt_status_t status = MQTT_ERROR;
+  mqtt_queue_item_t item = {
+    .operation = MQTT_OPERATION_SUBSCRIBE,
+    .topic = SENSOR_DATA_LED_STATE_TOPIC,
+    .topic_length = sizeof(SENSOR_DATA_LED_STATE_TOPIC) - 1
+  };
+  xQueueSend(mqtt_tx_queue, &item, portMAX_DELAY);
   for (;;)
   {
-    if (status != MQTT_SUCCESS)
+    if (xQueueReceive(mqtt_rx_queue, &item, portMAX_DELAY) == pdPASS &&
+        item.operation == MQTT_OPERATION_RECIEVE)
     {
-      xSemaphoreTake(mqtt_mutex, portMAX_DELAY);
-//      status = mqtt_subscribe(RAZORPAY_TOPIC, strlen(RAZORPAY_TOPIC));
-//      printf("MQTT subscribe %s (status=%d)\r\n",
-//             status == MQTT_SUCCESS ? "succeeded" : "failed", (int)status);
-//      xSemaphoreGive(mqtt_mutex);
+      printf("MQTT topic: %.*s\r\n", (int)item.topic_length, item.topic);
+      printf("MQTT payload: ");
+      fwrite(item.payload, 1, item.payload_length, stdout);
+      printf("\r\n");
     }
-    vTaskDelay(pdMS_TO_TICKS(5000));
+  }
+}
+
+static void AT_cmd_dispatcher_task(void *argument)
+{
+  (void)argument;
+  static char topic_buffer[MAX_MQTT_TOPIC_SIZE];
+  static char payload_buffer[MAX_MQTT_PAYLOAD_SIZE];
+  mqtt_queue_item_t item;
+  mqtt_queue_item_t new_message;
+
+  /* Transfer AT UART ownership after the unchanged startup connection. */
+  esp32_io_claim_owner();
+  for (;;)
+  {
+    if (ulTaskNotifyTake(pdTRUE, 0) != 0)
+    {
+      publish_time_status = esp32_get_sntp_time(&publish_timestamp);
+      xTaskNotifyGive(mqtt_publisher_handle);
+    }
+
+    if (xQueueReceive(mqtt_tx_queue, &item, 0) == pdPASS)
+    {
+      if (item.operation == MQTT_OPERATION_PUBLISH)
+      {
+        mqtt_status_t status = mqtt_publish(item.topic, item.topic_length,
+                                            item.payload, item.payload_length);
+        printf("MQTT publish %s (status=%d)\r\n",
+               status == MQTT_SUCCESS ? "succeeded" : "failed", (int)status);
+      }
+      else if (item.operation == MQTT_OPERATION_SUBSCRIBE)
+      {
+    	printf("Topic:%s,%u\r\n",item.topic,item.topic_length);
+        mqtt_status_t status = mqtt_subscribe(item.topic, item.topic_length);
+        printf("MQTT subscribe %s (status=%d)\r\n",
+               status == MQTT_SUCCESS ? "succeeded" : "failed", (int)status);
+      }
+    }
+
+    /* Reset capacities on every call; the API replaces them with lengths.
+     * ESP32_OK is zero, so test the status explicitly rather than as a bool. */
+    mqtt_receive_t mqtt_data = {
+      .p_topic = topic_buffer,
+      .topic_length = sizeof(topic_buffer),
+      .p_payload = payload_buffer,
+      .payload_length = sizeof(payload_buffer)
+    };
+    if (esp32_recv_mqtt_data(&mqtt_data) == ESP32_OK &&
+        mqtt_data.payload_length > 0)
+    {
+      new_message = (mqtt_queue_item_t){.operation = MQTT_OPERATION_RECIEVE};
+      new_message.topic_length = mqtt_data.topic_length;
+      new_message.payload_length = mqtt_data.payload_length;
+      memcpy(new_message.topic, mqtt_data.p_topic, mqtt_data.topic_length);
+      memcpy(new_message.payload, mqtt_data.p_payload, mqtt_data.payload_length);
+      if (xQueueSend(mqtt_rx_queue, &new_message, 0) != pdPASS)
+        printf("MQTT receive dropped: RX queue full\r\n");
+    }
+    vTaskDelay(pdMS_TO_TICKS(10));
   }
 }
 
