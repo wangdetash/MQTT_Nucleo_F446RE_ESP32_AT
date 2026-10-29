@@ -31,6 +31,8 @@
 #include "mqtt_helper.h"
 #include "mqtt_queue.h"
 #include "application_config.h"
+#include "jobs.h"
+#include "ota_application.h"
 
 /* USER CODE END Includes */
 
@@ -57,6 +59,7 @@ DMA_HandleTypeDef hdma_uart4_rx;
 /* USER CODE BEGIN PV */
 /* xTaskCreate stack depth is in StackType_t words: 2048 = 8192 bytes. */
 #define MQTT_TASK_STACK_DEPTH 2048U
+#define OTA_TASK_STACK_DEPTH 1024U
 static QueueHandle_t mqtt_tx_queue;
 static QueueHandle_t mqtt_rx_queue;
 static TaskHandle_t mqtt_publisher_handle;
@@ -79,7 +82,7 @@ static void MX_USART2_UART_Init(void);
 static void mqtt_publish_task(void *argument);
 static void mqtt_recieve_task(void *argument);
 static void AT_cmd_dispatcher_task(void *argument);
-
+static void ota_task(void *argument);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -132,6 +135,7 @@ int main(void)
   setvbuf(stdout, NULL, _IONBF, 0);
   printf("Application running ...\r\n");
   esp32_status_t esp_status = esp32_init();
+#ifndef USE_OTA
   /* Initialize UART DMA before requesting the module's version. */
   static char firmware_version[1024];
   esp32_status_t version_status = esp32_get_firmware_version(
@@ -159,7 +163,9 @@ int main(void)
   mqtt_status_t mqtt_status = mqtt_connect(CLIENT_ID, MQTT_BROKER, MQTT_PORT);
   printf("mqtt_connect: %s (status=%d)\r\n",
          mqtt_status == MQTT_SUCCESS ? "succeeded" : "failed", (int)mqtt_status);
-
+#else
+  printf("Already connected to MQTT broker..");
+#endif
   mqtt_tx_queue = xQueueCreate(5, sizeof(mqtt_queue_item_t));
   mqtt_rx_queue = xQueueCreate(5, sizeof(mqtt_queue_item_t));
   if (mqtt_tx_queue == NULL || mqtt_rx_queue == NULL ||
@@ -171,6 +177,12 @@ int main(void)
                   NULL, tskIDLE_PRIORITY + 1, &at_dispatcher_handle) != pdPASS)
   {
     printf("MQTT task creation failed\r\n");
+    Error_Handler();
+  }
+  if (xTaskCreate(ota_task, "ota_start", OTA_TASK_STACK_DEPTH,
+                  NULL, tskIDLE_PRIORITY + 2, NULL) != pdPASS)
+  {
+    printf("OTA task creation failed\r\n");
     Error_Handler();
   }
   vTaskStartScheduler();
@@ -459,14 +471,18 @@ static void mqtt_recieve_task(void *argument)
   xQueueSend(mqtt_tx_queue, &item, portMAX_DELAY);
   for (;;)
   {
-    if (xQueueReceive(mqtt_rx_queue, &item, portMAX_DELAY) == pdPASS &&
+    if (xQueueReceive(mqtt_rx_queue, &item, pdMS_TO_TICKS(1000)) == pdPASS &&
         item.operation == MQTT_OPERATION_RECIEVE)
     {
       printf("MQTT topic: %.*s\r\n", (int)item.topic_length, item.topic);
       printf("MQTT payload: ");
       fwrite(item.payload, 1, item.payload_length, stdout);
       printf("\r\n");
+
+      (void)ota_handle_incoming_mqtt_message(item.topic, item.topic_length,
+                                             (char *)item.payload, item.payload_length);
     }
+    ota_poll();
   }
 }
 
@@ -490,9 +506,10 @@ static void AT_cmd_dispatcher_task(void *argument)
 
     if (xQueueReceive(mqtt_tx_queue, &item, 0) == pdPASS)
     {
+      mqtt_status_t status = MQTT_ERROR;
       if (item.operation == MQTT_OPERATION_PUBLISH)
       {
-        mqtt_status_t status = mqtt_publish(item.topic, item.topic_length,
+        status = mqtt_publish(item.topic, item.topic_length,
                                             item.payload, item.payload_length);
         printf("MQTT publish %s (status=%d)\r\n",
                status == MQTT_SUCCESS ? "succeeded" : "failed", (int)status);
@@ -500,10 +517,13 @@ static void AT_cmd_dispatcher_task(void *argument)
       else if (item.operation == MQTT_OPERATION_SUBSCRIBE)
       {
     	printf("Topic:%s,%u\r\n",item.topic,item.topic_length);
-        mqtt_status_t status = mqtt_subscribe(item.topic, item.topic_length);
+        status = mqtt_subscribe(item.topic, item.topic_length);
         printf("MQTT subscribe %s (status=%d)\r\n",
                status == MQTT_SUCCESS ? "succeeded" : "failed", (int)status);
       }
+      if (item.completion_task != NULL)
+        xTaskNotify(item.completion_task, status == MQTT_SUCCESS ? 1U : 2U,
+                    eSetValueWithOverwrite);
     }
 
     /* Reset capacities on every call; the API replaces them with lengths.
@@ -527,6 +547,34 @@ static void AT_cmd_dispatcher_task(void *argument)
     }
     vTaskDelay(pdMS_TO_TICKS(10));
   }
+}
+
+/* Callers remain alive until the dispatcher has consumed their task handle. */
+bool mqtt_dispatch_sync(mqtt_queue_item_t *item)
+{
+  uint32_t result = 0;
+  if (item == NULL || item->topic_length == 0 ||
+      item->topic_length >= sizeof(item->topic) ||
+      item->payload_length > sizeof(item->payload)) return false;
+  item->topic[item->topic_length] = '\0';
+  item->completion_task = xTaskGetCurrentTaskHandle();
+  if (xQueueSend(mqtt_tx_queue, item, pdMS_TO_TICKS(5000)) != pdPASS)
+    return false;
+  return xTaskNotifyWait(0, UINT32_MAX, &result, portMAX_DELAY) == pdTRUE &&
+         result == 1U;
+}
+static void ota_task(void *argument)
+{
+	(void)argument;
+	if(ota_start() == OTA_SUCCESS)
+	{
+		printf("Jobs start-next request published; awaiting server response\r\n");
+	}
+	else
+	{
+		printf("Jobs start-next request failed\r\n");
+	}
+	vTaskDelete(NULL);
 }
 
 /* USER CODE END 4 */
